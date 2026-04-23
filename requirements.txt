@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+geopandas
+rasterio
+httpx
+python-dotenv
+osmnx
+whitebox
+folium
+Pillow
