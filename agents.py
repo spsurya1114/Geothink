@@ -70,10 +70,9 @@ Return ONLY this JSON:
 {
   "relevant_tools": ["whitebox", "rasterio", "geopandas"],
   "key_parameters": {
-    "flow_accumulation_threshold": 50,
-    "elevation_low_risk_m": 75,
-    "elevation_high_risk_m": 100,
-    "target_crs": "EPSG:32644"
+    "flow_accumulation_threshold": 5000,
+    "low_m": 5,
+    "high_m": 15
   },
   "reasoning": "one sentence"
 }
@@ -145,14 +144,15 @@ fetch_dem, reproject, clip_to_boundary, fill_depressions,
 flow_direction, flow_accumulation, extract_streams,
 hand_analysis, threshold_classify, vector_overlay, export_result
 
-ALLOWED CRS: EPSG:4326, EPSG:32644, EPSG:32643, EPSG:3857
+ALLOWED CRS: EPSG:4326, auto, EPSG:32642 to EPSG:32647, EPSG:3857
 
 RULES:
 1. Always start with fetch_dem as step 1
-2. Always reproject to EPSG:32644 as step 2
+2. Always add 'target_crs': 'auto' in inputs for the reproject step
 3. step_id must be sequential starting from 1
 4. depends_on must reference valid prior step_ids
-5. Raw JSON only
+5. For 'threshold_classify', inject "mode": "coastal" into 'inputs' if the query/region is coastal (e.g., ocean proximity, sea-level rise). Otherwise, default to "mode": "fluvial".
+6. Raw JSON only
 """
         )
 

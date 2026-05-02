@@ -130,14 +130,30 @@ def _fetch_dem(step, context):
     try:
         gdf = ox.geocode_to_gdf(place_name)
         bounds = gdf.total_bounds # [minx, miny, maxx, maxy]
+        context["boundary_gdf"] = gdf  # Cache for vector_overlay
     except Exception as e:
-        raise ValueError(f"Could not resolve place name '{place_name}' via OSM: {e}")
+        print(f"[fetch_dem] Warning: Could not resolve '{place_name}' as Polygon. Trying as Point...")
+        try:
+            # Fallback: geocode as a point, then create a ~20km bounding box around it
+            # 0.1 degree is roughly 11km at the equator.
+            lat, lon = ox.geocode(place_name)
+            bounds = [lon - 0.1, lat - 0.1, lon + 0.1, lat + 0.1]
+            print(f"[fetch_dem] Created 20x20km bounding box around {lat}, {lon}")
+        except Exception as e2:
+            raise ValueError(f"Could not resolve place name '{place_name}' via OSM at all: {e2}")
 
-    # Calculate tiles for the bounds at Zoom Level 11 (suitable for city scale DEM)
+    # Calculate tiles for the bounds, starting at Zoom Level 11 (suitable for city scale DEM)
     # Mapzen elevation tiles: https://s3.amazonaws.com/elevation-tiles-prod/geotiff/{z}/{x}/{y}.tif
     z = 11
     tiles = list(mercantile.tiles(bounds[0], bounds[1], bounds[2], bounds[3], z))
     
+    # Dynamic Resolution Scaling: If the region is massive, drop resolution to speed up math.
+    # Keep total tiles <= 12 to ensure pipeline finishes quickly.
+    while len(tiles) > 12 and z > 6:
+        z -= 1
+        tiles = list(mercantile.tiles(bounds[0], bounds[1], bounds[2], bounds[3], z))
+        print(f"[fetch_dem] Region is massive. Dropping resolution to Zoom Level {z} ({len(tiles)} tiles)...")
+
     print(f"[fetch_dem] Downloading {len(tiles)} tiles at zoom {z}...")
     
     src_files_to_mosaic = []
@@ -176,8 +192,40 @@ def _fetch_dem(step, context):
         "transform": out_trans
     })
 
+    # Crop the mosaic to the exact bounding box
+    from rasterio.io import MemoryFile
+    from rasterio.mask import mask
+    from shapely.geometry import box
+    from rasterio.warp import transform_geom
+
+    with MemoryFile() as memfile:
+        with memfile.open(**out_meta) as temp_src:
+            temp_src.write(mosaic)
+            
+        with memfile.open() as src:
+            # Create a Shapely box from the original lat/lon bounds (EPSG:4326)
+            bbox = box(bounds[0], bounds[1], bounds[2], bounds[3])
+            
+            # Transform the bbox from EPSG:4326 to the DEM's CRS (e.g. EPSG:3857)
+            bbox_proj = transform_geom("EPSG:4326", src.crs, bbox)
+            
+            # Crop the mosaic to the bounding box
+            try:
+                out_image, out_transform = mask(src, [bbox_proj], crop=True)
+                out_meta.update({
+                    "height": out_image.shape[1],
+                    "width": out_image.shape[2],
+                    "transform": out_transform
+                })
+                final_data = out_image
+                print(f"[fetch_dem] Successfully cropped DEM to bounding box.")
+            except ValueError:
+                # Fallback if mask fails (e.g. bounds don't overlap exactly)
+                print(f"[fetch_dem] Warning: Could not crop DEM to bounding box.")
+                final_data = mosaic
+
     with rasterio.open(out_path, "w", **out_meta) as dest:
-        dest.write(mosaic)
+        dest.write(final_data)
 
     with rasterio.open(out_path) as src:
         print(f"[fetch_dem] DEM loaded: {src.width}x{src.height} "
@@ -189,12 +237,13 @@ def _fetch_dem(step, context):
 
 def _reproject(step, context):
     """
-    Reproject the DEM to UTM Zone 44N (EPSG:32644).
+    Reproject the DEM to the appropriate UTM Zone.
     This is essential for accurate distance/area calculations —
     lat/lon degrees are not equal in meters across the map.
     """
+    import math
     src_path   = context.get("dem_path")
-    target_crs = step.inputs.get("target_crs", "EPSG:32644")
+    target_crs = step.inputs.get("target_crs", "auto")
 
     if not src_path:
         raise ValueError("reproject needs dem_path in context")
@@ -202,6 +251,16 @@ def _reproject(step, context):
     out_path = OUTPUT_DIR / "dem_reprojected.tif"
 
     with rasterio.open(src_path) as src:
+        if target_crs == "auto":
+            from rasterio.warp import transform_bounds
+            # The downloaded DEM is likely in Web Mercator (meters). We need degrees.
+            minx, miny, maxx, maxy = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+            # Calculate UTM zone based on center longitude
+            center_lon = (minx + maxx) / 2.0
+            utm_zone = math.floor((center_lon + 180) / 6.0) + 1
+            target_crs = f"EPSG:326{utm_zone}"
+            print(f"[reproject] Auto-detected UTM Zone {utm_zone} -> {target_crs}")
+
         # Skip reprojection if already in target CRS
         if str(src.crs) == target_crs:
             print(f"[reproject] Already in {target_crs}, skipping")
@@ -311,42 +370,80 @@ def _extract_streams(step, context):
 
 def _threshold_classify(step, context):
     """
-    Classify every pixel into a flood risk zone using HAND (Height Above Nearest Drainage).
-    Uses WhiteboxTools to compute Elevation Above Stream, then classifies risk using numpy.
-    
-    Risk levels:
-      3 = High risk   (HAND <= low_m)
-      2 = Medium risk (low_m < HAND <= high_m)
-      1 = Low risk    (HAND > high_m)
+    Classify every pixel into a flood risk zone.
+    Modes:
+      - "fluvial" (default): Uses HAND (Height Above Nearest Drainage). Good for inland rivers.
+      - "coastal": Hybrid mode. Uses both HAND and absolute DEM elevation, taking the highest risk. Good for storm surge + inland rivers.
     """
-    dem_path     = context.get("filled_dem_path") or context.get("dem_path")
+    dem_path = context.get("filled_dem_path") or context.get("dem_path")
+    mode = step.inputs.get("mode", "fluvial")
+
+    if not dem_path:
+        raise ValueError("threshold_classify needs dem_path in context")
+
+    # Ensure reasonable thresholds (LLM might hallucinate huge numbers like 75m)
+    low_m  = step.inputs.get("low_m", 5)
+    high_m = step.inputs.get("high_m", 15)
+    
+    # Cap thresholds to prevent the entire map from turning red
+    if low_m > 10: low_m = 5
+    if high_m > 25: high_m = 15
+
+    out_path = OUTPUT_DIR / "flood_risk.tif"
     streams_path = context.get("streams_path")
 
-    if not dem_path or not streams_path:
-        raise ValueError("threshold_classify needs dem_path and streams_path in context")
-
-    low_m  = step.inputs.get("low_m", 5)    # e.g., 5 meters HAND is high risk
-    high_m = step.inputs.get("high_m", 15)  # e.g., 15 meters HAND is low risk
+    if not streams_path:
+        raise ValueError(f"{mode} threshold_classify needs streams_path in context")
 
     hand_path = OUTPUT_DIR / "hand.tif"
-    out_path  = OUTPUT_DIR / "flood_risk.tif"
 
-    print("[threshold_classify] Computing Elevation Above Stream (HAND)...")
-    wbt.elevation_above_stream(dem=str(Path(dem_path).resolve()), streams=str(Path(streams_path).resolve()), output=str(hand_path.resolve()))
+    if mode == "fluvial":
+        print("[threshold_classify] Mode: Fluvial. Computing Elevation Above Stream (HAND)...")
+        wbt.elevation_above_stream(dem=str(Path(dem_path).resolve()), streams=str(Path(streams_path).resolve()), output=str(hand_path.resolve()))
+        
+        with rasterio.open(hand_path) as src:
+            data = src.read(1).astype(np.float32)
+            nodata = src.nodata
+            profile = src.profile.copy()
 
-    with rasterio.open(hand_path) as src:
-        hand = src.read(1).astype(np.float32)
-        nodata = src.nodata
-        profile = src.profile.copy()
+        risk = np.zeros_like(data, dtype=np.uint8)
+        valid_mask = (data != nodata) if nodata is not None else np.ones_like(data, dtype=bool)
 
-    risk = np.zeros_like(hand, dtype=np.uint8)
+        risk[valid_mask & (data > high_m)] = 1
+        risk[valid_mask & (data > low_m) & (data <= high_m)] = 2
+        risk[valid_mask & (data <= low_m)] = 3
 
-    # Classify HAND
-    valid_mask = (hand != nodata) if nodata is not None else np.ones_like(hand, dtype=bool)
+    elif mode == "coastal":
+        print("[threshold_classify] Mode: Coastal (Hybrid). Computing HAND and absolute DEM elevation...")
+        wbt.elevation_above_stream(dem=str(Path(dem_path).resolve()), streams=str(Path(streams_path).resolve()), output=str(hand_path.resolve()))
+        
+        with rasterio.open(hand_path) as src:
+            hand_data = src.read(1).astype(np.float32)
+            nodata = src.nodata
+            profile = src.profile.copy()
+            
+        with rasterio.open(dem_path) as src:
+            dem_data = src.read(1).astype(np.float32)
 
-    risk[valid_mask & (hand > high_m)] = 1                              # Low risk
-    risk[valid_mask & (hand > low_m) & (hand <= high_m)] = 2            # Medium risk
-    risk[valid_mask & (hand >= 0) & (hand <= low_m)] = 3                # High risk
+        valid_mask = (hand_data != nodata) if nodata is not None else np.ones_like(hand_data, dtype=bool)
+
+        # Fluvial Risk (HAND)
+        hand_risk = np.zeros_like(hand_data, dtype=np.uint8)
+        hand_risk[valid_mask & (hand_data > high_m)] = 1
+        hand_risk[valid_mask & (hand_data > low_m) & (hand_data <= high_m)] = 2
+        hand_risk[valid_mask & (hand_data <= low_m)] = 3
+
+        # Coastal Risk (Absolute Elevation)
+        dem_risk = np.zeros_like(dem_data, dtype=np.uint8)
+        dem_risk[valid_mask & (dem_data > high_m)] = 1
+        dem_risk[valid_mask & (dem_data > low_m) & (dem_data <= high_m)] = 2
+        dem_risk[valid_mask & (dem_data <= low_m)] = 3
+
+        # Combine: take the highest risk (3 > 2 > 1 > 0)
+        risk = np.maximum(hand_risk, dem_risk)
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
     profile.update(dtype=rasterio.uint8, nodata=0)
     with rasterio.open(out_path, "w", **profile) as dst:
@@ -362,7 +459,7 @@ def _threshold_classify(step, context):
 
     return {
         "risk_raster": str(out_path),
-        "hand_raster": str(hand_path),
+        "mode": mode,
         "low_m": low_m,
         "high_m": high_m,
         "stats": {
@@ -391,13 +488,17 @@ def _vector_overlay(step, context):
 
     out_path = OUTPUT_DIR / f"{place_name}_flood_risk_clipped.tif"
 
-    print(f"[vector_overlay] Fetching boundary for '{place_name}' via OSMnx...")
-    try:
-        # Fetch the geometry from OpenStreetMap
-        gdf = ox.geocode_to_gdf(place_name)
-    except Exception as e:
-        print(f"[vector_overlay] Could not fetch boundary for {place_name}: {e}")
-        return {"risk_raster_clipped": risk_path}
+    print(f"[vector_overlay] Fetching boundary for '{place_name}'...")
+    
+    # Use cached geometry from fetch_dem if available to prevent API rate limiting
+    gdf = context.get("boundary_gdf")
+    if gdf is None:
+        try:
+            print(f"[vector_overlay] No cached boundary found. Calling OSMnx...")
+            gdf = ox.geocode_to_gdf(place_name)
+        except Exception as e:
+            print(f"[vector_overlay] Could not fetch boundary for {place_name}: {e}")
+            return {"risk_raster_clipped": risk_path}
 
     print(f"[vector_overlay] Found boundary for {place_name}")
 
@@ -414,14 +515,19 @@ def _vector_overlay(step, context):
     shapes = [mapping(geom) for geom in gdf.geometry]
 
     with rasterio.open(risk_path) as src:
-        clipped, transform = mask(src, shapes, crop=True, nodata=0)
-        profile = src.profile.copy()
-        profile.update(
-            transform=transform,
-            width=clipped.shape[2],
-            height=clipped.shape[1],
-            nodata=0
-        )
+        try:
+            # Explicitly enforce nodata=0 so pixels outside the polygon become 0 (transparent)
+            clipped, transform = mask(src, shapes, crop=True, nodata=0)
+            profile = src.profile.copy()
+            profile.update(
+                transform=transform,
+                width=clipped.shape[2],
+                height=clipped.shape[1],
+                nodata=0
+            )
+        except ValueError as e:
+            print(f"[vector_overlay] Warning: mask failed ({e}). Returning unclipped.")
+            return {"risk_raster_clipped": risk_path}
 
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(clipped)

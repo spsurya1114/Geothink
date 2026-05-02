@@ -274,60 +274,140 @@ def create_ui():
         *SASTRA Deemed University — School of Computing — CSE (AI & DS) 2023–27*
         """)
 
-        # Input row
-        with gr.Row():
-            with gr.Column(scale=3):
-                query_input = gr.Textbox(
-                    label       = "Natural Language Query",
-                    placeholder = "Show flood risk for Trichy using terrain analysis",
-                    lines       = 2,
+        # Wrap everything in Tabs
+        with gr.Tabs():
+            # TAB 1: Analysis Pipeline
+            with gr.Tab("Analysis Pipeline"):
+                # Input row
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        query_input = gr.Textbox(
+                            label       = "Natural Language Query",
+                            placeholder = "Show flood risk for Trichy using terrain analysis",
+                            lines       = 2,
+                        )
+                    with gr.Column(scale=1):
+                        region_input = gr.Textbox(
+                            label   = "Region",
+                            value   = "Trichy",
+                            lines   = 2,
+                        )
+
+                run_btn = gr.Button(
+                    "▶ Run Flood Risk Analysis",
+                    variant="primary",
+                    size="lg"
                 )
-            with gr.Column(scale=1):
-                region_input = gr.Textbox(
-                    label   = "Region",
-                    value   = "Trichy",
-                    lines   = 2,
+
+                map_output = gr.HTML(
+                    label = "Interactive Flood Risk Map",
+                    elem_classes=["map-container"]
                 )
 
-        run_btn = gr.Button(
-            "▶ Run Flood Risk Analysis",
-            variant="primary",
-            size="lg"
-        )
+                with gr.Accordion("Agent Pipeline Logs", open=True) as log_accordion:
+                    log_output = gr.Textbox(
+                        label    = "Execution Logs",
+                        lines    = 15, 
+                        elem_classes = ["log-box"],
+                        interactive  = False,
+                        autoscroll   = True,
+                        show_label   = False
+                    )
 
-        map_output = gr.HTML(
-            label = "Interactive Flood Risk Map",
-            elem_classes=["map-container"]
-        )
+                stats_output = gr.Markdown(label="Results")
 
-        with gr.Accordion("Agent Pipeline Logs", open=True) as log_accordion:
-            log_output = gr.Textbox(
-                label    = "Execution Logs",
-                lines    = 15, 
-                elem_classes = ["log-box"],
-                interactive  = False,
-                autoscroll   = True,
-                show_label   = False
-            )
+                gr.Examples(
+                    examples=[
+                        ["Show flood risk for Trichy using terrain analysis", "Trichy"],
+                        ["Identify high risk flood zones in Tiruchirappalli", "Trichy"],
+                        ["Analyze flood prone areas near Cauvery river", "Trichy"],
+                    ],
+                    inputs=[query_input, region_input],
+                    label="Example Queries"
+                )
 
-        stats_output = gr.Markdown(label="Results")
+                run_btn.click(
+                    fn      = run_geothink,
+                    inputs  = [query_input, region_input],
+                    outputs = [log_output, stats_output, map_output, log_accordion],
+                )
 
-        # ... rest of your code (Examples and Wire up) ...
-        gr.Examples(
-            examples=[
-                ["Show flood risk for Trichy using terrain analysis", "Trichy"],
-                ["Identify high risk flood zones in Tiruchirappalli", "Trichy"],
-                ["Analyze flood prone areas near Cauvery river", "Trichy"],
-            ],
-            inputs=[query_input, region_input],
-            label="Example Queries"
-        )
+            # TAB 2: Model Evaluation
+            with gr.Tab("Model Evaluation"):
+                gr.Markdown("### 📊 Ground-Truth Evaluation Dashboard")
+                gr.Markdown("Upload a historical flood Shapefile (.zip or .shp) to mathematically compare against our AI's prediction.")
+                
+                with gr.Row():
+                    with gr.Column():
+                        import glob
+                        import os
+                        def get_prediction_files():
+                            files = glob.glob("outputs/*_flood_risk_clipped.tif")
+                            return [os.path.basename(f) for f in files]
+                            
+                        pred_dropdown = gr.Dropdown(
+                            choices=get_prediction_files(), 
+                            label="Select AI Prediction Raster", 
+                            info="Select a previously generated flood risk map."
+                        )
+                        refresh_btn = gr.Button("↻ Refresh List", size="sm")
+                        
+                        gt_upload = gr.File(
+                            label="Upload Ground Truth Shapefile (.zip or .shp)",
+                            file_types=[".zip", ".shp"]
+                        )
+                        
+                        eval_btn = gr.Button("📊 Run Evaluation", variant="primary")
+                        
+                    with gr.Column():
+                        eval_metrics = gr.Markdown("### Evaluation Metrics\nRun evaluation to see accuracy scores.")
+                        eval_img = gr.HTML(label="Visualization Map")
 
-        run_btn.click(
-            fn      = run_geothink,
-            inputs  = [query_input, region_input],
-            outputs = [log_output, stats_output, map_output, log_accordion],
-        )
+                def run_evaluation(pred_filename, gt_file):
+                    if not pred_filename or not gt_file:
+                        return "Please select both a prediction file and a ground truth file.", ""
+                    
+                    try:
+                        from evaluate import evaluate_flood_model
+                        pred_path = f"outputs/{pred_filename}"
+                        gt_path = gt_file.name
+                        
+                        metrics, img_b64 = evaluate_flood_model(pred_path, gt_path)
+                        
+                        md = f"""
+                        ### Results
+                        - **Accuracy:** `{metrics['accuracy']}%`
+                        - **Precision:** `{metrics['precision']}%`
+                        - **Recall:** `{metrics['recall']}%`
+                        - **IoU (Intersection over Union):** `{metrics['iou']}%`
+                        """
+                        
+                        img_html = f'''
+                        <div style="border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; overflow: hidden; background: #000;">
+                            <img src="data:image/png;base64,{img_b64}" style="width: 100%; height: auto; display: block;" />
+                            <div style="padding: 10px; background: rgba(0,0,0,0.8); color: white; font-family: sans-serif; font-size: 14px;">
+                                <b>Legend:</b> 
+                                <span style="color:#2ecc71; margin-right:15px;">■ True Positive (Correct)</span>
+                                <span style="color:#e74c3c; margin-right:15px;">■ False Positive (False Alarm)</span>
+                                <span style="color:#3498db;">■ False Negative (Missed Flood)</span>
+                            </div>
+                        </div>
+                        '''
+                        return md, img_html
+                    except Exception as e:
+                        return f"### Error during evaluation\n`{str(e)}`", ""
+
+                eval_btn.click(
+                    fn=run_evaluation,
+                    inputs=[pred_dropdown, gt_upload],
+                    outputs=[eval_metrics, eval_img]
+                )
+                
+                refresh_btn.click(
+                    fn=lambda: gr.update(choices=get_prediction_files()),
+                    inputs=[],
+                    outputs=[pred_dropdown]
+                )
 
     return demo
 

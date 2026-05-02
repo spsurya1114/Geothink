@@ -26,9 +26,14 @@ class GISOperation(str, Enum):
 # India uses EPSG:32643 and EPSG:32644 (UTM zones)
 # Trichy specifically falls in EPSG:32644
 VALID_CRS = {
+    "auto",        # Automatically calculate UTM based on region
     "EPSG:4326",   # standard lat/lon (WGS84)
-    "EPSG:32643",  # UTM Zone 43N (western India)
-    "EPSG:32644",  # UTM Zone 44N (eastern India — Trichy is here)
+    "EPSG:32642",  # UTM Zone 42N
+    "EPSG:32643",  # UTM Zone 43N
+    "EPSG:32644",  # UTM Zone 44N
+    "EPSG:32645",  # UTM Zone 45N
+    "EPSG:32646",  # UTM Zone 46N
+    "EPSG:32647",  # UTM Zone 47N
     "EPSG:3857",   # web mercator (for map display)
 }
 
